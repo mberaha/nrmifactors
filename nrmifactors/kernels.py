@@ -10,16 +10,23 @@ from nrmifactors.priors import NNIGPrior
 def nnig_update(data, mu0, lam, a, b, key):
     ybar = np.mean(data)
     card = data.shape[0]
-    post_mean = (lam * mu0 + np.sum(data)) / (lam + card)
-    post_lam = lam + card
-    post_shape = a + 0.5 * card
-    post_rate = b + \
-        0.5 * np.sum((data - ybar)**2) + \
-        0.5 * lam * card * (mu0 - ybar)**2 / post_lam
-    key, subk1, subk2 = random.split(key, 3)
-    var_post = tfd.InverseGamma(post_shape, post_rate).sample(seed=subk1)
-    mu_post = tfd.Normal(post_mean, np.sqrt(var_post /post_lam)).sample(seed=subk2)
-    return np.array([mu_post, var_post]), key
+    post_mean = (mu0 / 25.0 + np.sum(data) / 1.0) / (1.0 / 25.0 + card / 1.0)
+    post_var = 1.0 / (1.0 / 25.0 + card / 1.0)
+    key, subk1 = random.split(key)
+    
+    mu = tfd.Normal(post_mean, np.sqrt(post_var)).sample(seed=subk1)
+    return np.array([mu, 1.0]), key
+
+    # post_mean = (lam * mu0 + np.sum(data)) / (lam + card)
+    # post_lam = lam + card
+    # post_shape = a + 0.5 * card
+    # post_rate = b + \
+    #     0.5 * np.sum((data - ybar)**2) + \
+    #     0.5 * lam * card * (mu0 - ybar)**2 / post_lam
+    # key, subk1, subk2 = random.split(key, 3)
+    # var_post = tfd.InverseGamma(post_shape, post_rate).sample(seed=subk1)
+    # mu_post = tfd.Normal(post_mean, np.sqrt(var_post /post_lam)).sample(seed=subk2)
+    # return np.array([mu_post, var_post]), key
 
 @jit
 def norm_lpdf(data, atoms):

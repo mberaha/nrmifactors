@@ -2,11 +2,16 @@ from nrmifactors.kernels import nnig_update, norm_lpdf
 from nrmifactors.utils import run_hmc
 from nrmifactors.priors import NrmiFacPrior
 import jax.numpy as np
-from jax import jit, random
+from jax import jit, lax, random
 from jax.scipy.special import logsumexp
 
 from tensorflow_probability.substrates import jax as tfp
+log_acceptance_proba_getter = \
+    tfp.mcmc.simple_step_size_adaptation.hmc_like_log_accept_prob_getter_fn
 tfd = tfp.distributions
+tfb = tfp.bijectors
+
+LOG_TARGET_ACCEPT_PROBA = np.log(0.75)
 
 
 def update_atoms(data, clus, nclus, kp_mu0, kp_lam, kp_a, kp_b, rng_key):
@@ -48,38 +53,105 @@ def update_clus(data, lam, m, j, atoms, rng_key):
     clus = tfd.Categorical(probs=probas).sample(seed=subkey).T
     return clus, rng_key
 
-@jit
-def lambda_full_cond_lpdf(lam, clus, m, j, u, lam_prior_a, lam_prior_b):
-    lm = np.matmul(lam, m)
-    out = np.sum(tfd.Gamma(
-        lam_prior_a, lam_prior_b,
-        force_probs_to_zero_outside_support=True).log_prob(lam))
-    out -= np.sum(np.sum(lm * j, axis=1) * u)
-    cluscount = np.sum(clus[:, :, np.newaxis] ==
-                        np.arange(j.shape[0]), axis=1)
-    out += np.sum(np.log(lm) * cluscount)
-    return out
-
 
 @jit
-def update_lambda(
-        clus, lam, m, j, u, lam_prior_a, lam_prior_b, rng_key, step_size,
-        nsteps=50, adapt_rate=0.01):
+def update_lambda_unconstrained(
+        clus, lam, m, j, u, lam_prior_a, lam_prior_b, rng_key, step_size=0.0001,
+        nsteps=50, niter=100):
+    """Update lambda given the current parameters.
+    We run HMC for niter steps, then we propose a "rescaling" move, i.e.: 
+    lam = c * lam with c >= 0.
+    """
+    bijector = tfb.Log()
 
-    def target_lpdf(x): return lambda_full_cond_lpdf(
-        x, clus, m, j, u, lam_prior_a, lam_prior_b)
+    @jit
+    def full_cond_lpdf(transformed_lam, cluscount, prior_shape, prior_rate):
+        prior = tfd.TransformedDistribution(
+            tfd.Gamma(
+            prior_shape, prior_rate,
+            force_probs_to_zero_outside_support=True),
+            bijector=bijector)
+
+        lam = bijector.inverse(transformed_lam)
+        lm = np.matmul(lam, m)
+        out = prior.log_prob(transformed_lam)
+        out -= np.sum(np.sum(lm * j, axis=1) * u)
+        out += np.sum(np.log(lm) * cluscount)
+        return out
+
+    cluscount = np.sum(clus[:, :, np.newaxis] == np.arange(j.shape[0]), axis=1)
+
+    def target_lpdf(x): return full_cond_lpdf(x, cluscount, lam_prior_a, lam_prior_b)
+
+    transformed_lam = bijector.forward(lam)
 
     rng_key, subkey = random.split(rng_key)
-    nburn = int(niter * 0.8)
-    kernel = tfp.mcmc.HamiltonianMonteCarlo(
+    nburn = niter - 2
+    inner_kernel = tfp.mcmc.HamiltonianMonteCarlo(
         target_log_prob_fn=target_lpdf, num_leapfrog_steps=nsteps,
         step_size=step_size)
     kernel = tfp.mcmc.SimpleStepSizeAdaptation(
         inner_kernel=inner_kernel, num_adaptation_steps=int(nburn * 0.8))
     out = tfp.mcmc.sample_chain(
-        num_results=niter, num_burnin_steps=nburn, current_state=lam,
-        kernel=kernel, trace_fn=None, seed=subkey)
-    return out[-1, :, :], rng_key
+        num_results=2, num_burnin_steps=nburn, current_state=transformed_lam,
+        kernel=kernel, 
+        trace_fn=lambda _, pkr: pkr.inner_results.accepted_results.step_size, 
+        seed=subkey)
+    lam = bijector.inverse(out[0][-1, :, :])
+    step_size = out[1][-1]
+    return lam, rng_key, step_size
+
+
+@jit
+def update_lambda(
+        clus, lam, m, j, u, lam_prior_a, lam_prior_b, rng_key, step_size=0.0001,
+        nsteps=50, niter=100):
+    """
+    Update lambda given the current parameters.
+    We run HMC for niter steps, then we propose a "rescaling" move, i.e.: 
+    lam = c * lam with c >= 0.
+    """
+
+    @jit
+    def full_cond_lpdf(lam, cluscount, prior_shape, prior_rate):
+        lm = np.matmul(lam, m)
+        out = np.sum(tfd.Gamma(
+            prior_shape, prior_rate,
+            force_probs_to_zero_outside_support=True).log_prob(lam))
+        out -= np.sum(np.sum(lm * j, axis=1) * u)
+        out += np.sum(np.log(lm) * cluscount)
+        return out
+
+    cluscount = np.sum(clus[:, :, np.newaxis] == np.arange(j.shape[0]), axis=1)
+
+    def target_lpdf(x): return full_cond_lpdf(x, cluscount, lam_prior_a, lam_prior_b)
+
+    rng_key, subkey = random.split(rng_key)
+    nburn = niter - 2
+    inner_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+        target_log_prob_fn=target_lpdf, num_leapfrog_steps=nsteps,
+        step_size=step_size)
+    kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+        inner_kernel=inner_kernel, num_adaptation_steps=int(nburn * 0.8))
+    out = tfp.mcmc.sample_chain(
+        num_results=2, num_burnin_steps=nburn, current_state=lam,
+        kernel=kernel, 
+        trace_fn=lambda _, pkr: pkr.inner_results.accepted_results.step_size, 
+        seed=subkey)
+    lam = out[0][-1, :, :]
+    step_size = out[1][-1]
+
+    rng_key, subkey = random.split(rng_key)
+    scale_factor = tfd.LogNormal(0., 0.5).sample(seed=subkey)
+    prop_lam = lam * scale_factor
+    arate = target_lpdf(prop_lam) - target_lpdf(lam)
+
+    rng_key, subkey = random.split(rng_key)
+    lam = lax.cond(arate > np.log(tfd.Uniform(0, 1).sample(seed=subkey)),
+                   lambda _: prop_lam, lambda _: lam,
+                   lam) 
+
+    return lam, rng_key, step_size
 
 
 @jit
@@ -87,30 +159,44 @@ def update_m(
         clus, lam, m, j, u, m_prior_a, m_prior_b, rng_key, step_size=0.0001,
         nsteps=50, niter=100):
     @jit
-    def full_cond_lpdf(m, prior_shape, prior_rate):
+    def full_cond_lpdf(m, cluscount, prior_shape, prior_rate):
         lm = np.matmul(lam, m)
         out = np.sum(tfd.Gamma(
             prior_shape, prior_rate,
             force_probs_to_zero_outside_support=True).log_prob(m))
         out -= np.sum(np.sum(lm * j, axis=1) * u)
-        cluscount = np.sum(clus[:, :, np.newaxis] ==
-                           np.arange(j.shape[0]), axis=1)
         out += np.sum(np.log(lm) * cluscount)
         return out
 
-    def target_lpdf(x): return full_cond_lpdf(x, m_prior_a, m_prior_b)
+    cluscount = np.sum(clus[:, :, np.newaxis] == np.arange(j.shape[0]), axis=1)
+    def target_lpdf(x): return full_cond_lpdf(x, cluscount, m_prior_a, m_prior_b)
 
     rng_key, subkey = random.split(rng_key)
-    nburn = int(niter * 0.8)
+    nburn = niter - 1
     inner_kernel = tfp.mcmc.HamiltonianMonteCarlo(
         target_log_prob_fn=target_lpdf, num_leapfrog_steps=nsteps,
         step_size=step_size)
     kernel = tfp.mcmc.SimpleStepSizeAdaptation(
         inner_kernel=inner_kernel, num_adaptation_steps=int(nburn * 0.8))
     out = tfp.mcmc.sample_chain(
-        num_results=niter, num_burnin_steps=nburn, current_state=m,
-        kernel=kernel, trace_fn=None, seed=subkey)
-    return out[-1, :, :], rng_key
+        num_results=2, num_burnin_steps=nburn, current_state=m,
+        kernel=kernel, 
+        trace_fn=lambda _, pkr: pkr.inner_results.accepted_results.step_size, 
+        seed=subkey)
+    m = out[0][-1, :, :]
+    step_size = out[1][-1]
+
+    rng_key, subkey = random.split(rng_key)
+    scale_factor = tfd.LogNormal(0., 0.5).sample(seed=subkey)
+    prop_m = m * scale_factor
+    arate = target_lpdf(prop_m) - target_lpdf(m)
+
+    rng_key, subkey = random.split(rng_key)
+    m = lax.cond(arate > np.log(tfd.Uniform(0, 1).sample(seed=subkey)),
+                   lambda _: prop_m, lambda _: m,
+                   m) 
+
+    return m, rng_key, step_size
 
 @jit
 def update_u(data, lam, m, j, rng_key):
@@ -121,7 +207,7 @@ def update_u(data, lam, m, j, rng_key):
     return out, rng_key
 
 
-def run_one_step(state, data, prior, hmc_lambda, hmc_m, rng_key):
+def run_one_step(state, data, prior, rng_key):
     nclus = state.atoms.shape[0]
 
     state.clus, rng_key = update_clus(
@@ -135,9 +221,9 @@ def run_one_step(state, data, prior, hmc_lambda, hmc_m, rng_key):
         state.clus, state.lam, state.m, state.u, prior.j_prior.a, 
         prior.j_prior.b, rng_key)
 
-    state.lam, rng_key = update_lambda(
+    state.lam, rng_key, state.lam_step_size = update_lambda(
         state.clus, state.lam, state.m, state.j, state.u, 
-        prior.lam_prior.a, prior.lam_prior.b, rng_key)
+        prior.lam_prior.a, prior.lam_prior.b, rng_key, step_size=state.lam_step_size)
 
     # state.lam, rng_key = update_lambda_marg(
     #     data, state.lam, state.m, state.j, state.u, state.atoms,
@@ -146,10 +232,32 @@ def run_one_step(state, data, prior, hmc_lambda, hmc_m, rng_key):
     # state.clus, rng_key = update_clus(
     #     data, state.lam, state.m, state.j, state.atoms, rng_key)
     
-    state.m, rng_key = update_m(
+    state.m, rng_key, state.m_step_size = update_m(
         state.clus, state.lam, state.m, state.j, state.u, 
-        prior.m_prior.a, prior.m_prior.b, rng_key) 
+        prior.m_prior.a, prior.m_prior.b, rng_key, step_size=state.m_step_size) 
 
     state.u, rng_key = update_u(data, state.lam, state.m, state.j, rng_key)
 
     return state, rng_key
+
+
+def varimax(A, tol=1e-6, max_iter=100):
+    """Return rotated components."""
+    nrow, ncol = A.shape
+    rotation_matrix = np.eye(ncol)
+    var = 0
+
+    for _ in range(max_iter):
+        comp_rot = np.dot(A, rotation_matrix)
+        tmp = comp_rot * np.transpose((comp_rot ** 2).sum(axis=0) / nrow)
+        u, s, v = np.linalg.svd(np.dot(A.T, comp_rot ** 3 - tmp))
+        rotation_matrix = np.dot(u, v)
+        var_new = np.sum(s)
+        if var != 0 and var_new < var * (1 + tol):
+            break
+        var = var_new
+
+    return np.dot(A, rotation_matrix).T
+
+def postprocess_lambda_chain(lambdas):    
+    pass
