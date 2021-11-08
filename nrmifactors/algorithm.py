@@ -3,7 +3,8 @@ from nrmifactors.utils import run_hmc
 from nrmifactors.priors import NrmiFacPrior
 import jax.numpy as np
 from jax import jit, lax, random
-from jax.scipy.special import logsumexp
+from jax.ops import index_update, index
+from functools import partial
 
 from tensorflow_probability.substrates import jax as tfp
 log_acceptance_proba_getter = \
@@ -14,18 +15,12 @@ tfb = tfp.bijectors
 LOG_TARGET_ACCEPT_PROBA = np.log(0.75)
 
 
+@partial(jit, static_argnums=(2,))
 def update_atoms(data, clus, nclus, kp_mu0, kp_lam, kp_a, kp_b, rng_key):
     out = []
     for c in range(nclus):
-        currdata = np.ravel(data[clus == c])
-        if len(currdata) == 0:
-            rng_key, subk1, subk2 = random.split(rng_key, 3)
-            var = tfd.Gamma(kp_a, kp_b).sample(seed=subk1)
-            mu = tfd.Normal(kp_mu0, np.sqrt(var / kp_lam)).sample(seed=subk2)
-            val = np.array([mu, var])
-        else:
-            val, rng_key = nnig_update(
-                np.ravel(data[clus == c]), kp_mu0, kp_lam, kp_a, kp_b, rng_key)
+        val, rng_key = nnig_update(
+                data, clus, c, kp_mu0, kp_lam, kp_a, kp_b, rng_key)
         out.append(val)
 
     return np.vstack(out), rng_key
@@ -48,11 +43,11 @@ def update_clus(data, lam, m, j, atoms, rng_key):
     prior_probas = np.log(np.matmul(lam, m) * j)
     likes = norm_lpdf(data, atoms)
     probas = np.exp(prior_probas + likes)
-    probas /= np.sum(probas, axis=1)[:, np.newaxis, :]
+    probas /= np.nansum(probas, axis=1)[:, np.newaxis, :]
     rng_key, subkey = random.split(rng_key)
     clus = tfd.Categorical(probs=probas).sample(seed=subkey).T
+    # clus = index_update(clus, nan_idx, -10)
     return clus, rng_key
-
 
 @jit
 def update_lambda_unconstrained(
@@ -199,19 +194,19 @@ def update_m(
     return m, rng_key, step_size
 
 @jit
-def update_u(data, lam, m, j, rng_key):
-    n = np.array([len(x) for x in data]).astype(float)
+def update_u(data, n, lam, m, j, rng_key):
     t = np.sum(np.matmul(lam, m) * j, axis=1)
     rng_key, subkey = random.split(rng_key)
     out = tfd.Gamma(n, t).sample(seed=subkey)
     return out, rng_key
 
 
-def run_one_step(state, data, prior, rng_key):
+def run_one_step(state, data, nan_idx, nobs_by_group, prior, rng_key):
     nclus = state.atoms.shape[0]
-
+    
     state.clus, rng_key = update_clus(
         data, state.lam, state.m, state.j, state.atoms, rng_key)
+    state.clus = index_update(state.clus, nan_idx, -10)
 
     state.atoms, rng_key = update_atoms(
         data, state.clus, nclus, prior.kern_prior.mu0, prior.kern_prior.lam, prior.
@@ -236,28 +231,7 @@ def run_one_step(state, data, prior, rng_key):
         state.clus, state.lam, state.m, state.j, state.u, 
         prior.m_prior.a, prior.m_prior.b, rng_key, step_size=state.m_step_size) 
 
-    state.u, rng_key = update_u(data, state.lam, state.m, state.j, rng_key)
+    state.u, rng_key = update_u(
+        data, nobs_by_group, state.lam, state.m, state.j, rng_key)
 
     return state, rng_key
-
-
-def varimax(A, tol=1e-6, max_iter=100):
-    """Return rotated components."""
-    nrow, ncol = A.shape
-    rotation_matrix = np.eye(ncol)
-    var = 0
-
-    for _ in range(max_iter):
-        comp_rot = np.dot(A, rotation_matrix)
-        tmp = comp_rot * np.transpose((comp_rot ** 2).sum(axis=0) / nrow)
-        u, s, v = np.linalg.svd(np.dot(A.T, comp_rot ** 3 - tmp))
-        rotation_matrix = np.dot(u, v)
-        var_new = np.sum(s)
-        if var != 0 and var_new < var * (1 + tol):
-            break
-        var = var_new
-
-    return np.dot(A, rotation_matrix).T
-
-def postprocess_lambda_chain(lambdas):    
-    pass
