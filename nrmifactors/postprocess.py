@@ -107,10 +107,7 @@ def dissipative_lie_rattle_penalized(
             args[0], args[1], args[2], args[3], grad_f, mu, stepsize, chi)
 
     def loop_cond(args):
-        c1 = args[0] < 100
-        c2 = np.linalg.norm(args[3]) > thr
-        c_out = (c1 + c2) == 2
-        return c1
+        return (args[0] < maxiter) & (np.linalg.norm(args[3]) > thr)
  
     curr_x = x0
     curr_y = np.zeros(x0.shape)
@@ -149,6 +146,22 @@ def penalty(constraints, x, rho, lambdas):
     return 0.5 * rho * np.sum(relu(lambdas / rho + constraints(x))**2)
 
 
+@partial(jit, static_argnums=(1, 2, 3))
+def ralm_step(i, grad_loss, constraints, grad_constraints,
+              curr_x, prev_x, mu, stepsize, eps, rho, lambdas, 
+              min_lambda, max_lambda, target_thr):
+    next_x, _ = dissipative_lie_rattle_penalized(
+            grad_loss, constraints, grad_constraints, curr_x, mu, 
+            stepsize, eps, rho, lambdas, maxiter=100)
+    lambdas = np.clip(
+            lambdas + rho * (constraints(next_x)),
+            min_lambda, max_lambda)
+    rho = rho * 0.9
+    eps = np.max(np.array([target_thr, eps * 0.9]))
+    return i+1, next_x, curr_x, eps, rho, lambdas
+
+
+
 def ralm(loss_fn, grad_loss, constraints, grad_constraints, x0, mu, stepsize,
          init_thr, target_thr, init_lambdas, min_lambda, max_lambda, init_rho, 
          dmin, maxiter=1000):
@@ -160,38 +173,57 @@ def ralm(loss_fn, grad_loss, constraints, grad_constraints, x0, mu, stepsize,
     init_lambdas: the initial values of the Lagrange multipliers
     init_rho: the initial value of the Lagrange multiplier
     """
+    def loop_carry_fn(args):
+        i, curr_x, prev_x, eps, rho, lambdas = args
+        return ralm_step(i, grad_loss, constraints, grad_constraints,
+                         curr_x, prev_x, mu, stepsize, eps, rho, lambdas, 
+                         min_lambda, max_lambda, target_thr)
+
+    def loop_cond(args):
+        i, curr_x, prev_x, eps, rho, lambdas = args
+        c1 = i < maxiter
+        c2 = True if len(all_x) < 2 else \
+            np.linalg.norm(curr_x - prev_x) > dmin
+        c3 = eps > target_thr
+        return c1 & (c2 | c3)
 
     lambdas = init_lambdas
     rho = init_rho
-    
     curr_x = x0
-    prev_x = x0
+    prev_x = x0 - 10
     eps = init_thr
     print("Init Loss: ", loss_fn(curr_x))
-    out = [curr_x]
+    all_x = [curr_x]
 
-    for i in range(maxiter):
-        curr_x, _ = dissipative_lie_rattle_penalized(
-            grad_loss, constraints, grad_constraints, curr_x, mu, 
-            stepsize, eps, rho, lambdas, maxiter=100)
-        out.append(curr_x)
+    n_iter, curr_x, prev_x, eps, rho, lambdas = lax.while_loop(
+        loop_cond,
+        loop_carry_fn,
+        (0, curr_x, prev_x, eps, rho, lambdas))
+    return curr_x
 
-        if np.isnan(curr_x).any():
-            break
 
-        print("Loss: {0}, step: {1}, eps: {2}".format(
-            loss_fn(curr_x), np.linalg.norm(curr_x - prev_x), eps))
+    # for i in range(maxiter):
+    #     curr_x, _ = dissipative_lie_rattle_penalized(
+    #         grad_loss, constraints, grad_constraints, curr_x, mu, 
+    #         stepsize, eps, rho, lambdas, maxiter=100)
+    #     out.append(curr_x)
 
-        if np.linalg.norm(curr_x - prev_x) < dmin and eps < target_thr:
-            break
+    #     if np.isnan(curr_x).any():
+    #         break
 
-        lambdas = np.clip(
-            lambdas + rho * (constraints(curr_x)),
-            min_lambda, max_lambda)
-        print("max(lambdas) : ", np.max(lambdas))
-        rho = rho * 0.9
-        eps = np.max(np.array([target_thr, eps * 0.9]))
-        prev_x = curr_x
+    #     print("Loss: {0}, step: {1}, eps: {2}".format(
+    #         loss_fn(curr_x), np.linalg.norm(curr_x - prev_x), eps))
+
+    #     if np.linalg.norm(curr_x - prev_x) < dmin and eps < target_thr:
+    #         break
+
+    #     lambdas = np.clip(
+    #         lambdas + rho * (constraints(curr_x)),
+    #         min_lambda, max_lambda)
+    #     print("max(lambdas) : ", np.max(lambdas))
+    #     rho = rho * 0.9
+    #     eps = np.max(np.array([target_thr, eps * 0.9]))
+    #     prev_x = curr_x
 
     return out
 
@@ -232,20 +264,21 @@ def gd(f, grad_f, x0, stepsize, thr, maxiter=1000):
     return curr_x
 
 
+def varimax(A, tol=1e-6, max_iter=100):
+    """Return rotated components."""
+    nrow, ncol = A.shape
+    rotation_matrix = np.eye(ncol)
+    var = 0
 
+    for _ in range(max_iter):
+        comp_rot = np.dot(A, rotation_matrix)
+        tmp = comp_rot * np.transpose((comp_rot ** 2).sum(axis=0) / nrow)
+        u, s, v = np.linalg.svd(np.dot(A.T, comp_rot ** 3 - tmp))
+        rotation_matrix = np.dot(u, v)
+        var_new = np.sum(s)
+        if var != 0 and var_new < var * (1 + tol):
+            break
+        var = var_new
 
+    return np.dot(A, rotation_matrix).T
     
-
-    
-    
-
-
-
-
-
-
-
-
-
-
-
