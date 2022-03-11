@@ -146,7 +146,7 @@ def penalty(constraints, x, rho, lambdas):
     return 0.5 * rho * np.sum(relu(lambdas / rho + constraints(x))**2)
 
 
-@partial(jit, static_argnums=(1, 2, 3))
+# @partial(jit, static_argnums=(1, 2, 3))
 def ralm_step(i, grad_loss, constraints, grad_constraints,
               curr_x, prev_x, mu, stepsize, eps, rho, lambdas, 
               min_lambda, max_lambda, target_thr):
@@ -175,6 +175,7 @@ def ralm(loss_fn, grad_loss, constraints, grad_constraints, x0, mu, stepsize,
     """
     def loop_carry_fn(args):
         i, curr_x, prev_x, eps, rho, lambdas = args
+        print("lambdas: ", np.array_str(lambdas.T), "rho: ", np.array_str(rho))
         return ralm_step(i, grad_loss, constraints, grad_constraints,
                          curr_x, prev_x, mu, stepsize, eps, rho, lambdas, 
                          min_lambda, max_lambda, target_thr)
@@ -195,37 +196,36 @@ def ralm(loss_fn, grad_loss, constraints, grad_constraints, x0, mu, stepsize,
     print("Init Loss: ", loss_fn(curr_x))
     all_x = [curr_x]
 
-    n_iter, curr_x, prev_x, eps, rho, lambdas = lax.while_loop(
-        loop_cond,
-        loop_carry_fn,
-        (0, curr_x, prev_x, eps, rho, lambdas))
+    # n_iter, curr_x, prev_x, eps, rho, lambdas = lax.while_loop(
+    #     loop_cond,
+    #     loop_carry_fn,
+    #     (0, curr_x, prev_x, eps, rho, lambdas))
+    # return curr_x
+
+
+    for i in range(maxiter):
+        curr_x, _ = dissipative_lie_rattle_penalized(
+            grad_loss, constraints, grad_constraints, curr_x, mu, 
+            stepsize, eps, rho, lambdas, maxiter=100)
+
+        if np.isnan(curr_x).any():
+            break
+
+        print("Loss: {0}, step: {1}, eps: {2}".format(
+            loss_fn(curr_x), np.linalg.norm(curr_x - prev_x), eps))
+
+        if np.linalg.norm(curr_x - prev_x) < dmin and eps < target_thr:
+            break
+
+        lambdas = np.clip(
+            lambdas + rho * (constraints(curr_x)),
+            min_lambda, max_lambda)
+        print("max(lambdas) : ", np.max(lambdas))
+        rho = rho * 0.9
+        eps = np.max(np.array([target_thr, eps * 0.9]))
+        prev_x = curr_x
+
     return curr_x
-
-
-    # for i in range(maxiter):
-    #     curr_x, _ = dissipative_lie_rattle_penalized(
-    #         grad_loss, constraints, grad_constraints, curr_x, mu, 
-    #         stepsize, eps, rho, lambdas, maxiter=100)
-    #     out.append(curr_x)
-
-    #     if np.isnan(curr_x).any():
-    #         break
-
-    #     print("Loss: {0}, step: {1}, eps: {2}".format(
-    #         loss_fn(curr_x), np.linalg.norm(curr_x - prev_x), eps))
-
-    #     if np.linalg.norm(curr_x - prev_x) < dmin and eps < target_thr:
-    #         break
-
-    #     lambdas = np.clip(
-    #         lambdas + rho * (constraints(curr_x)),
-    #         min_lambda, max_lambda)
-    #     print("max(lambdas) : ", np.max(lambdas))
-    #     rho = rho * 0.9
-    #     eps = np.max(np.array([target_thr, eps * 0.9]))
-    #     prev_x = curr_x
-
-    return out
 
 
 

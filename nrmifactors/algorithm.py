@@ -2,9 +2,11 @@ from nrmifactors.kernels import nnig_update, norm_lpdf
 from nrmifactors.utils import run_hmc
 from nrmifactors.priors import NrmiFacPrior
 import jax.numpy as np
-from jax import jit, lax, random
-from jax.ops import index_update, index
+from jax import jit, lax, random, vmap
+from jax.ops import index_update, index, segment_sum
 from functools import partial
+from sklearn.cluster import KMeans
+
 
 from tensorflow_probability.substrates import jax as tfp
 log_acceptance_proba_getter = \
@@ -42,11 +44,11 @@ def update_Js(clus, lam, m, u, j_prior_a, j_prior_b, rng_key):
 def update_clus(data, lam, m, j, atoms, rng_key):
     prior_probas = np.log(np.matmul(lam, m) * j)
     likes = norm_lpdf(data, atoms)
-    probas = np.exp(prior_probas + likes)
+    # probas = np.exp(prior_probas + likes)
+    probas = np.exp(likes)
     probas /= np.nansum(probas, axis=1)[:, np.newaxis, :]
     rng_key, subkey = random.split(rng_key)
-    clus = tfd.Categorical(probs=probas).sample(seed=subkey).T
-    # clus = index_update(clus, nan_idx, -10)
+    clus = tfd.Categorical(logits=likes).sample(seed=subkey).T
     return clus, rng_key
 
 @jit
@@ -97,6 +99,13 @@ def update_lambda_unconstrained(
     return lam, rng_key, step_size
 
 
+@jit 
+def lambda_like_lpdf(lam, m, j, u, cluscount):
+    lm = np.matmul(lam, m)
+    out = - np.sum(np.sum(lm * j, axis=1) * u)
+    out += np.sum(np.log(lm) * cluscount)
+    return out
+
 @jit
 def update_lambda(
         clus, lam, m, j, u, lam_prior_a, lam_prior_b, rng_key, step_size=0.0001,
@@ -108,13 +117,16 @@ def update_lambda(
     """
 
     @jit
-    def full_cond_lpdf(lam, cluscount, prior_shape, prior_rate):
-        lm = np.matmul(lam, m)
+    def prior_iid_gamma_lpdf(lam, prior_shape, prior_rate):
         out = np.sum(tfd.Gamma(
             prior_shape, prior_rate,
             force_probs_to_zero_outside_support=True).log_prob(lam))
-        out -= np.sum(np.sum(lm * j, axis=1) * u)
-        out += np.sum(np.log(lm) * cluscount)
+        return out
+
+    @jit
+    def full_cond_lpdf(lam, cluscount, prior_shape, prior_rate):
+        out = prior_iid_gamma_lpdf(lam, prior_shape, prior_rate) + \
+              lambda_like_lpdf(lam,  m, j, u, cluscount)
         return out
 
     cluscount = np.sum(clus[:, :, np.newaxis] == np.arange(j.shape[0]), axis=1)
@@ -147,6 +159,170 @@ def update_lambda(
                    lam) 
 
     return lam, rng_key, step_size
+
+
+@jit
+def get_lambda_mgp(phis, deltas):
+    taus = np.cumprod(deltas, axis=-1)
+    out = 1.0 / (phis * taus)
+    return out
+
+
+@jit
+def update_lambda_mgp(
+        clus, phis, deltas, m, j, u, mgp_nu, mgp_a1, mgp_a2, rng_key, step_size=0.0001,
+        nsteps=50, niter=100):
+
+    J = phis.shape[0]
+    H = phis.shape[1]
+
+    @jit
+    def phidelta_tovec(phis, deltas):
+        return np.concatenate([phis.reshape(-1, ), deltas])
+
+    @jit
+    def phidelta_fromvec(phidelta):
+        phis = np.reshape(phidelta[:J*H], (J, H))
+        deltas = phidelta[J*H:]
+        return phis, deltas
+
+    @jit
+    def mgp_prior(phis, deltas, nu, a1, a2):
+        out = np.sum(tfd.Gamma(
+            nu/2, nu/2,
+            force_probs_to_zero_outside_support=True).log_prob(phis))
+        out += tfd.Gamma(
+            a1, 1,
+            force_probs_to_zero_outside_support=True).log_prob(deltas[0])
+        out = np.sum(tfd.Gamma(
+            a2, 1,
+            force_probs_to_zero_outside_support=True).log_prob(deltas[1:]))
+        return out
+
+
+    @jit
+    def full_cond_lpdf(phis_deltas, cluscount):
+        phis, deltas = phidelta_fromvec(phis_deltas)
+        lam = get_lambda_mgp(phis, deltas)
+        out = mgp_prior(phis, deltas, mgp_nu, mgp_a1, mgp_a2) + \
+              lambda_like_lpdf(lam,  m, j, u, cluscount)
+        return out
+
+    cluscount = np.sum(clus[:, :, np.newaxis] == np.arange(j.shape[0]), axis=1)
+
+    def target_lpdf(x): return full_cond_lpdf(x, cluscount)
+
+    rng_key, subkey = random.split(rng_key)
+    nburn = niter - 2
+    inner_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+        target_log_prob_fn=target_lpdf, num_leapfrog_steps=nsteps,
+        step_size=step_size)
+    kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+        inner_kernel=inner_kernel, num_adaptation_steps=int(nburn * 0.8))
+    out = tfp.mcmc.sample_chain(
+        num_results=2, num_burnin_steps=nburn, current_state=phidelta_tovec(phis, deltas),
+        kernel=kernel, 
+        trace_fn=lambda _, pkr: pkr.inner_results.accepted_results.step_size, 
+        seed=subkey)
+    phis, deltas = phidelta_fromvec(out[0][-1, :])
+    step_size = out[1][-1]
+
+    return phis, deltas, rng_key, step_size
+
+
+@partial(jit, static_argnums=(2))
+def sp_matmul(A, B, shape):
+    """
+    Arguments:
+        A: (N, M) COO sparse matrix
+        B: (M,K) dense matrix
+        shape: value of N
+    Returns:
+        (N, K) dense matrix
+    """
+    in_ = B.take(A.col, axis=0)
+    prod = in_ * A.data[:, None]
+    res = segment_sum(prod, A.row, shape)
+    return res
+
+
+@jit 
+def multi_normal_prec_lpdf(x, sigma, sigma_logdet, tau):
+    base = 0.5 * (np.log(tau) * sigma.shape[0])
+    exp = - 0.5 * x.dot(sp_matmul(sigma, x.reshape(-1, 1), sigma.shape[0])) * tau
+    return base + exp
+
+
+@jit
+def update_lambda_gmrf(
+        clus, lam, m, j, u, sigma, sigma_logdet, tau, rng_key, 
+        step_size=0.0001, nsteps=50, niter=100):
+
+    bijector = tfb.Log()
+
+    @jit
+    def full_cond_lpdf(trans_lam):
+        lam  = bijector.inverse(trans_lam)
+        prior = vmap(
+            lambda x: multi_normal_prec_lpdf(
+                x, sigma, sigma_logdet, tau) +
+            np.sum(bijector.inverse_log_det_jacobian(x))
+            )(trans_lam.T)
+        return np.sum(prior) + lambda_like_lpdf(lam,  m, j, u, cluscount)
+        
+
+    cluscount = np.sum(clus[:, :, np.newaxis] == np.arange(j.shape[0]), axis=1)
+
+    def target_lpdf(x): return full_cond_lpdf(x)
+
+    rng_key, subkey = random.split(rng_key)
+    nburn = niter - 2
+    inner_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+        target_log_prob_fn=target_lpdf, num_leapfrog_steps=nsteps,
+        step_size=step_size)
+    kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+        inner_kernel=inner_kernel, num_adaptation_steps=int(nburn * 0.8))
+    out = tfp.mcmc.sample_chain(
+        num_results=2, num_burnin_steps=nburn, current_state=bijector.forward(lam),
+        kernel=kernel, 
+        trace_fn=lambda _, pkr: pkr.inner_results.accepted_results.step_size, 
+        seed=subkey)
+    log_lam = out[0][-1, :, :]
+    step_size = out[1][-1]
+
+    return bijector.inverse(log_lam), rng_key, step_size
+
+
+@jit 
+def update_tau_gmrf(lam, tau, sigma, sigma_logdet, rng_key, step_size=0.0001):
+
+    bijector = tfb.Log()
+
+    @jit
+    def target_lpdf(log_tau):
+        tau = bijector.inverse(log_tau)
+        out = np.sum(vmap(
+            lambda x: multi_normal_prec_lpdf(
+                x, sigma, sigma_logdet, tau)
+            )(np.log(lam).T))
+        
+        out += tfd.InverseGamma(a, b).log_prob(tau) + \
+            bijector.inverse_log_det_jacobian(log_tau)
+        return out
+
+    rng_key, subkey = random.split(rng_key)
+    # inner_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+    #     target_log_prob_fn=target_lpdf, num_leapfrog_steps=5, step_size=step_size)
+    # kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+    #     inner_kernel=inner_kernel, num_adaptation_steps=5)
+    kernel = tfp.mcmc.RandomWalkMetropolis(target_log_prob_fn=target_lpdf)
+    out = tfp.mcmc.sample_chain(
+        num_results=2, num_burnin_steps=8, current_state=bijector.forward(tau),
+        kernel=kernel, 
+        trace_fn=None, 
+        seed=subkey)
+    log_tau = out[0]
+    return bijector.inverse(log_tau), rng_key, step_size
 
 
 @jit
@@ -212,13 +388,32 @@ def run_one_step(state, data, nan_idx, nobs_by_group, prior, rng_key):
         data, state.clus, nclus, prior.kern_prior.mu0, prior.kern_prior.lam, prior.
         kern_prior.a, prior.kern_prior.b, rng_key)
 
+
     state.j, rng_key = update_Js(
         state.clus, state.lam, state.m, state.u, prior.j_prior.a, 
         prior.j_prior.b, rng_key)
 
-    state.lam, rng_key, state.lam_step_size = update_lambda(
-        state.clus, state.lam, state.m, state.j, state.u, 
-        prior.lam_prior.a, prior.lam_prior.b, rng_key, step_size=state.lam_step_size)
+    if prior.lam_prior == "mgp":
+        state.phis, state.deltas, rng_key, state.lam_step_size = update_lambda_mgp(
+            state.clus, state.phis, state.deltas, state.m, state.j, state.u, 
+            prior.lam_prior_mgp.nu, prior.lam_prior_mgp.a1, prior.lam_prior_mgp.a2, rng_key, 
+            step_size=state.lam_step_size)
+        state.lam = get_lambda_mgp(state.phis, state.deltas)
+    elif prior.lam_prior == "gmrf":
+        state.lam, rng_key, state.lam_step_size = update_lambda_gmrf(
+            state.clus, state.lam, state.m, state.j, state.u, 
+            prior.lam_prior.gmrf.sigma, 
+            prior.lam_prior.gmrf.sigma_logdet, 
+            state.tau, rng_key, 
+            step_size=state.lam_step_size)
+        state.tau, rng_key, state.tau_step_size = update_tau_gmrf(
+            state.lam, state.tau, prior.lam_prior_gmrf.tau_a, 
+            prior.lam_prior_gmrf.tau_b, prior.lam_prior_gmrf.sigma,
+            prior.lam_prior_gmrf.sigma_logdet, rng_key, state.tau_step_size)
+    else:
+        state.lam, rng_key, state.lam_step_size = update_lambda(
+            state.clus, state.lam, state.m, state.j, state.u, 
+            prior.lam_prior_iid.a, prior.lam_prior_iid.b, rng_key, step_size=state.lam_step_size)
 
     # state.lam, rng_key = update_lambda_marg(
     #     data, state.lam, state.m, state.j, state.u, state.atoms,
@@ -233,5 +428,7 @@ def run_one_step(state, data, nan_idx, nobs_by_group, prior, rng_key):
 
     state.u, rng_key = update_u(
         data, nobs_by_group, state.lam, state.m, state.j, rng_key)
+
+    state.iter += 1
 
     return state, rng_key
