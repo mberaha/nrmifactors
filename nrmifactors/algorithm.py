@@ -294,7 +294,7 @@ def update_lambda_gmrf(
 
 
 @jit 
-def update_tau_gmrf(lam, tau, sigma, sigma_logdet, rng_key, step_size=0.0001):
+def update_tau_gmrf(tau, a, b, lam, sigma, sigma_logdet, rng_key, step_size=0.0001):
 
     bijector = tfb.Log()
 
@@ -402,13 +402,14 @@ def run_one_step(state, data, nan_idx, nobs_by_group, prior, rng_key):
     elif prior.lam_prior == "gmrf":
         state.lam, rng_key, state.lam_step_size = update_lambda_gmrf(
             state.clus, state.lam, state.m, state.j, state.u, 
-            prior.lam_prior.gmrf.sigma, 
-            prior.lam_prior.gmrf.sigma_logdet, 
+            prior.lam_prior_gmrf.sigma, 
+            prior.lam_prior_gmrf.sigma_logdet, 
             state.tau, rng_key, 
             step_size=state.lam_step_size)
         state.tau, rng_key, state.tau_step_size = update_tau_gmrf(
-            state.lam, state.tau, prior.lam_prior_gmrf.tau_a, 
-            prior.lam_prior_gmrf.tau_b, prior.lam_prior_gmrf.sigma,
+            state.tau, prior.lam_prior_gmrf.tau_a, 
+            prior.lam_prior_gmrf.tau_b, state.lam, 
+            prior.lam_prior_gmrf.sigma,
             prior.lam_prior_gmrf.sigma_logdet, rng_key, state.tau_step_size)
     else:
         state.lam, rng_key, state.lam_step_size = update_lambda(
