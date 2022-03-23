@@ -261,14 +261,15 @@ def adapt_lambda_mgp(lam, m, phis, deltas, a1, a2, iter,
         print("adding column")
         rng_key, subkey = random.split(rng_key)
         deltas = np.concatenate(
-            [deltas, tfd.Gamma(2, 1).sample((1, ), seed=subkey)])
+            [deltas, tfd.Gamma(mgp_a2, 1).sample((1, ), seed=subkey)])
         rng_key, subkey = random.split(rng_key)
-        new_phi_col = tfd.Gamma(2/2, 2/2).sample((phis.shape[0], 1), 
-                                                seed=subkey)
+        new_phi_col = tfd.Gamma(mgp_nu/2, mgp_nu/2).sample(
+            (phis.shape[0], 1), seed=subkey)
         phis = np.concatenate([phis, new_phi_col], axis=1)
         lam = get_lambda_mgp(phis, deltas)
         rng_key, subkey = random.split(rng_key)
-        new_m_row = tfd.Gamma(2, 2).sample((1, m.shape[1]), seed=subkey)
+        new_m_row = tfd.Gamma(m_prior_a, m_prior_b).sample(
+            (1, m.shape[1]), seed=subkey)
         m = np.concatenate([m, new_m_row], axis=0)
         return lam, m, phis, deltas, rng_key
 
@@ -321,7 +322,7 @@ def update_lambda_gmrf(
     @jit
     def full_cond_lpdf(trans_lam):
         lam  = bijector.inverse(trans_lam)
-        lm = np.matmult(lam, m)
+        lm = np.matmul(lam, m)
         mu = - np.log(trans_lam.shape[1])
         prior = vmap(
             lambda x: multi_normal_prec_lpdf(

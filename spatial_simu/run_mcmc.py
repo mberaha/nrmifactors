@@ -19,7 +19,6 @@ import pickle
 from sklearn.cluster import KMeans
 from copy import deepcopy
 
-
 from tensorflow_probability.substrates import jax as tfp
 tfd = tfp.distributions
 
