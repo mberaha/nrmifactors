@@ -21,6 +21,9 @@ class MGPPrior:
     nu: float
     a1: float
     a2: float
+    adapt_a1: float
+    adapt_a2: float
+    adapt_threshold: float
 
 @dataclass
 class GMRFPrior:

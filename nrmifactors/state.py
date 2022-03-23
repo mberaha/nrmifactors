@@ -18,4 +18,5 @@ class State:
     deltas: Optional[np.array] = None
     tau: Optional[float] = None
     tau_step_size: float = 1e-2
+    accept_lam_scaling: Optional[int] = 0
 

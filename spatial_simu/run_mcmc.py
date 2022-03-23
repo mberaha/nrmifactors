@@ -1,13 +1,17 @@
 import os
 os.environ["JAX_ENABLE_X64"] = "true"
-os.environ["xla_cpu_multi_thread_eigen"] = "true"
-os.environ["intra_op_parallelism_threads"] = "4"
+os.environ["xla_cpu_multi_thread_eigen"] = "False"
+os.environ["intra_op_parallelism_threads"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 
 import jax.numpy as np
 from jax import random
 from jax.experimental.sparse import COO
 from jax.ops import index
+from joblib import Parallel, delayed
+
 from nrmifactors import algorithm as algo
 from nrmifactors.state import State
 import nrmifactors.priors as priors
@@ -95,49 +99,8 @@ def get_true_dens(xgrid, weights, atoms):
     return dens
 
 
-
-
-if __name__ == "__main__":
-
-    nxx = [4, 8, 16]
-
-    for nx in nxx:
-
-    ngroups = nx**2
-    W = compute_G(nx, nx)
-
-    weights = get_weights(nx, nx)
-    datas = simulate_data(weights, 50)
-
-    # first our model, in parallel
-    groupedData = []
-    for g in range(ngroups):
-        groupedData.append(datas[datas['group'] == g]['datum'].values)
-
-    data = np.stack(groupedData)
-
-    prec = np.diag(W.sum(axis=1)) - W
-    eigvals, eigvecs = np.linalg.eigh(prec)
-    prec_logdet = np.sum(np.log(eigvals[eigvals > 1e-6]))
-    prec = COO.fromdense(prec)
-
-    natoms = 10
-    nlat = 5
-
-    km = KMeans(natoms)
-    km.fit(data.reshape(-1, 1))
-    clus = km.predict(data.reshape(-1,1)).reshape(data.shape)
-    means = km.cluster_centers_
-
-    init_atoms = np.hstack([means, np.ones_like(means) * 0.3])
-
-    prior = priors.NrmiFacPrior(
-        kern_prior=priors.NNIGPrior(0.0, 0.01, 5.0, 5.0),
-        lam_prior_gmrf=priors.GMRFPrior(sigma=prec, sigma_logdet=prec_logdet, tau_a=2, tau_b=2),
-        lam_prior="gmrf",
-        m_prior=priors.GammaPrior(2.0, 2.0),
-        j_prior=priors.GammaPrior(2.0, 2.0))
-
+def fit(prior, ngroups, nlat, natoms, init_atoms, clus, data, outdir):
+    key = random.PRNGKey(0)
 
     lam = np.ones((data.shape[0], nlat))
     m = tfd.Gamma(prior.m_prior.a, prior.m_prior.b).sample(
@@ -147,7 +110,7 @@ if __name__ == "__main__":
     u = np.ones(ngroups).astype(float)
 
     state = State(iter=0, atoms=init_atoms, j=j, lam=lam, m=m, 
-                  clus=clus, u=u, au=0.5)
+                  clus=clus, u=u, tau=2.5)
 
     nan_idx = index[np.isnan(data)]
     nobs_by_group = np.array(
@@ -165,6 +128,63 @@ if __name__ == "__main__":
         if (i > nburn) and (i % thin == 0):
             states.append(deepcopy(state))
 
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    with open(os.path.join(dir_path, "chains_{0}.pickle".format(ngroups))) as fp:
+    filename = os.path.join(outdir, "chains_groups_{0}_lat_{1}.pickle".format(ngroups, nlat))
+    with open(filename, "wb") as fp:
         pickle.dump(states, fp)
+    
+    return np.array([1])
+
+
+
+if __name__ == "__main__":
+
+    nxx = [4, 8, 16]
+
+    for nx in nxx:
+        ngroups = nx**2
+        W = compute_G(nx, nx)
+
+        weights = get_weights(nx, nx)
+        datas = simulate_data(weights, 100)
+
+        # first our model, in parallel
+        groupedData = []
+        for g in range(ngroups):
+            groupedData.append(datas[datas['group'] == g]['datum'].values)
+
+        data = np.stack(groupedData)
+
+        prec = np.diag(W.sum(axis=1)) - 0.95 * W
+        eigvals, eigvecs = np.linalg.eigh(prec)
+        prec_logdet = np.sum(np.log(eigvals[eigvals > 1e-6]))
+        prec = COO.fromdense(prec)
+
+        natoms = 20
+        km = KMeans(natoms)
+        km.fit(data.reshape(-1, 1))
+        clus = km.predict(data.reshape(-1,1)).reshape(data.shape)
+        means = km.cluster_centers_
+        init_atoms = np.hstack([means, np.ones_like(means) * 0.3])
+        prior = priors.NrmiFacPrior(
+            kern_prior=priors.NNIGPrior(0.0, 0.01, 5.0, 5.0),
+            lam_prior_gmrf=priors.GMRFPrior(sigma=prec, sigma_logdet=prec_logdet,
+                                            tau_a=2, tau_b=2),
+            lam_prior="gmrf",
+            m_prior=priors.GammaPrior(2.0, 2.0),
+            j_prior=priors.GammaPrior(2.0, 2.0))
+
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        nlat = np.array([1, 3, 5, 10])
+
+        delayed_fn = delayed(
+            lambda x: fit(deepcopy(prior), ngroups, x, natoms, init_atoms, clus, data, dir_path))
+
+        out = Parallel(n_jobs=5, prefer="threads")(delayed_fn(x) for x in nlat)
+
+        with open(os.path.join(dir_path, "all_out_{0}.pickle".format(nx)), "wb") as fp:
+            pickle.dump(out, fp)
+
+
+
+            
+            
