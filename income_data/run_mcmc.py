@@ -22,6 +22,16 @@ from tensorflow_probability.substrates import jax as tfp
 tfd = tfp.distributions
 
 
+import logging
+logger = logging.getLogger("root")
+
+class CheckTypesFilter(logging.Filter):
+    def filter(self, record):
+        return "check_types" not in record.getMessage()
+
+logger.addFilter(CheckTypesFilter())
+
+
 def eval_pred_dens(data, data2group, lam, m, j, atoms):
     weights = np.matmul(lam, m) * j
     weights /= weights.sum(axis=1)[:, np.newaxis]
@@ -103,6 +113,6 @@ if __name__ == "__main__":
         m_prior=priors.GammaPrior(2.0, 2.0),
         j_prior=priors.GammaPrior(2.0, 2.0))
 
-    for nlat in [2, 4, 6, 8, 10]:
+    for nlat in [8, 10]:
         fit(prior, nlat, init_atoms, data)
     

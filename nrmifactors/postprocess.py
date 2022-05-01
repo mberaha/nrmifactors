@@ -4,7 +4,6 @@ from jax.scipy.linalg import expm
 from functools import partial
 from jax import jit, grad, lax, vmap
 from jax.nn import relu
-from jax.ops import index, index_update
 
 grad_relu = vmap(grad(relu))
 
@@ -25,8 +24,7 @@ def project_on_sl_algebra(grad_eval, x):
     diag_out = np.zeros(out.shape[0])
     for i in range(out.shape[0] - 1):
         curr = np.zeros_like(diag_out)
-        curr = index_update(
-            curr, index[i:i+2], 
+        curr = curr.at[i:i+2].set(
             np.array([diag_gx[i] - diag_gx[i+1], -diag_gx[i] + diag_gx[i+1]]))
         diag_out += curr
     return out + np.diag(diag_out)
@@ -75,10 +73,7 @@ def dissipative_lie_rattle_fast(
             args[0], args[1], args[2], args[3], grad_f, mu, stepsize, chi)
 
     def loop_cond(args):
-        c1 = args[0] < maxiter
-        c2 = np.linalg.norm(args[3]) > thr
-        c_out = (c1 + c2) == 2
-        return c2
+        return (args[0] < maxiter) & (np.linalg.norm(args[3]) > thr)
  
     curr_x = x0
     curr_y = np.zeros(x0.shape)
