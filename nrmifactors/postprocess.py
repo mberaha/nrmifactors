@@ -276,4 +276,31 @@ def varimax(A, tol=1e-6, max_iter=100):
         var = var_new
 
     return np.dot(A, rotation_matrix).T
+
+
+def distmat(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Pairwise distance matrix"""
+    return vmap(lambda x1: vmap(lambda y1: np.sum((x1 - y1)**2))(y))(x)
+
+
+def greedy_align(template_dens, dens_lat):    
+    dists = distmat(template_dens, dens_lat)
+    out = []
+    for i in range(template_dens.shape[0]):
+        best = np.argmin(dists[i, :])
+        out.append(dens_lat[best, :])
+        dists = dists.at[:, best].set(1000)
+        
+    return np.stack(out)
+
+
+def optimal_align(template_dens, dens_lat):    
+    dists = distmat(template_dens, dens_lat)
+    out = []
+    for i in range(template_dens.shape[0]):
+        best = np.argmin(dists[i, :])
+        out.append(dens_lat[best, :])
+        dists = dists.at[:, best].set(1000)
+        
+    return np.stack(out)
     
